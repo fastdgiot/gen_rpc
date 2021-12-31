@@ -39,12 +39,12 @@
 start_link(Driver) when is_atom(Driver) ->
     case gen_rpc_helper:is_driver_enabled(Driver) of
         false -> ignore;
-        true -> gen_statem:start_link({local,gen_rpc_helper:make_process_name("server", Driver)}, ?MODULE, {Driver}, [])
+        true -> gen_statem:start_link({local, make_process_name(Driver)}, ?MODULE, {Driver}, [])
     end.
 
 -spec stop(atom()) -> ok.
 stop(Driver) when is_atom(Driver) ->
-    gen_statem:stop(gen_rpc_helper:make_process_name("server", Driver), normal, infinity).
+    gen_statem:stop(make_process_name(Driver), normal, infinity).
 
 %%% ===================================================
 %%% Behaviour callbacks
@@ -101,3 +101,7 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 %%% Private functions
 %%% ===================================================
 
+-spec make_process_name(atom()) -> atom().
+make_process_name(Driver) when is_atom(Driver) ->
+    DriverStr = erlang:atom_to_list(Driver),
+    erlang:list_to_atom("gen_rpc_server_" ++ DriverStr).

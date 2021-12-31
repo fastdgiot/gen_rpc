@@ -13,6 +13,7 @@
 -behaviour(gen_server).
 
 %%% Include the HUT library
+-include_lib("snabbkaffe/include/trace.hrl").
 -include("logger.hrl").
 %%% Include this library's name macro
 -include("app.hrl").
@@ -20,6 +21,8 @@
 -include("guards.hrl").
 %%% Include helpful guard macros
 -include("types.hrl").
+
+-define(NAME(NODE_OR_TUPLE), {client, NODE_OR_TUPLE}).
 
 %%% Local state
 -record(state, {socket :: port(),
@@ -51,18 +54,19 @@
 %%% Process exports
 -export([async_call_worker/5, cast_worker/4]).
 
+%%% Debug/test
+-export([where_is/1]).
+
 %%% ===================================================
 %%% Supervisor functions
 %%% ===================================================
 -spec start_link(node_or_tuple()) -> gen_server:startlink_ret().
 start_link(NodeOrTuple) when ?is_node_or_tuple(NodeOrTuple) ->
-    PidName = gen_rpc_helper:make_process_name("client", NodeOrTuple),
-    gen_server:start_link({local,PidName}, ?MODULE, {NodeOrTuple}, []).
+    gen_server:start_link({via, gen_rpc_registry, ?NAME(NodeOrTuple)}, ?MODULE, {NodeOrTuple}, []).
 
 -spec stop(node_or_tuple()) -> ok.
 stop(NodeOrTuple) when ?is_node_or_tuple(NodeOrTuple) ->
-    PidName = gen_rpc_helper:make_process_name("client", NodeOrTuple),
-    gen_server:stop(PidName, normal, infinity).
+    gen_server:stop(?NAME(NodeOrTuple), normal, infinity).
 
 %%% ===================================================
 %%% Server functions
@@ -90,8 +94,8 @@ call(NodeOrTuple, M, F, A, RecvTO, SendTO) when ?is_node_or_tuple(NodeOrTuple), 
                                          RecvTO =:= undefined orelse ?is_timeout(RecvTO),
                                          SendTO =:= undefined orelse ?is_timeout(SendTO) ->
     %% Create a unique name for the client because we register as such
-    PidName = gen_rpc_helper:make_process_name("client", NodeOrTuple),
-    case erlang:whereis(PidName) of
+    PidName = ?NAME(NodeOrTuple),
+    case gen_rpc_registry:whereis_name(PidName) of
         undefined ->
             ?log(info, "event=client_process_not_found target=\"~p\" action=spawning_client", [NodeOrTuple]),
             case gen_rpc_dispatcher:start_client(NodeOrTuple) of
@@ -133,7 +137,7 @@ cast(NodeOrTuple, M, F, A) ->
 -spec cast(node_or_tuple(), atom() | tuple(), atom() | function(), list(), timeout() | undefined) -> true.
 cast(NodeOrTuple, M, F, A, SendTO) when ?is_node_or_tuple(NodeOrTuple), is_atom(M) orelse is_tuple(M), is_atom(F), is_list(A),
                                  SendTO =:= undefined orelse ?is_timeout(SendTO) ->
-    _WorkerPid = erlang:spawn(?MODULE, cast_worker, [NodeOrTuple, {cast,M,F,A}, undefined, SendTO]),
+    cast_worker(NodeOrTuple, {cast, M, F, A}, undefined, SendTO),
     true.
 
 %% Evaluate {M, F, A} on connected nodes.
@@ -225,6 +229,10 @@ sbcast(Nodes, Name, Msg) when is_list(Nodes), is_atom(Name) ->
     Ref = erlang:make_ref(),
     Workers = [{erlang:spawn(?MODULE, cast_worker, [Node, {sbcast, Name, Msg, {self(), Ref, Node}}, undefined, undefined]), Node} || Node <- Nodes],
     parse_sbcast_results(Workers, Ref).
+
+-spec where_is(node_or_tuple()) -> pid() | undefined.
+where_is(NodeOrTuple) ->
+    gen_rpc_registry:whereis_name(?NAME(NodeOrTuple)).
 
 %%% ===================================================
 %%% Behaviour callbacks
@@ -347,7 +355,11 @@ handle_info({{sbcast,_Name,_Msg,_Caller} = PacketTuple, undefined}, State) ->
 
 %% Handle any TCP packet coming in
 handle_info({Driver,Socket,Data}, #state{socket=Socket, driver=Driver, driver_mod=DriverMod} = State) ->
-    _Reply = case erlang:binary_to_term(Data) of
+    MessageFromWire = erlang:binary_to_term(Data),
+    ?tp(gen_rpc_client_receive_message, #{ socket => gen_rpc_helper:socket_to_string(Socket)
+                                         , packet => MessageFromWire
+                                         }),
+    _Reply = case MessageFromWire of
         {call, Caller, Reply} ->
             ?log(debug, "event=call_reply_received driver=~s socket=\"~s\" caller=\"~p\" action=sending_reply",
                  [Driver, gen_rpc_helper:socket_to_string(Socket), Caller]),
@@ -412,14 +424,21 @@ terminate(_Reason, #state{keepalive=KeepAlive}) ->
 %%% Private functions
 %%% ===================================================
 send_cast(PacketTuple, #state{socket=Socket, driver=Driver, driver_mod=DriverMod} = State, SendTO, Activate) ->
+    ?tp(gen_rpc_send_cast, #{ sendto => SendTO
+                            , packet => PacketTuple
+                            , driver => Driver
+                            , socket => gen_rpc_helper:socket_to_string(Socket)
+                            }),
     Packet = erlang:term_to_binary(PacketTuple),
-    ?log(debug, "event=constructing_cast_term driver=~s socket=\"~s\" cast=\"~0p\"",
-         [Driver, gen_rpc_helper:socket_to_string(Socket), PacketTuple]),
     ok = DriverMod:set_send_timeout(Socket, SendTO),
     case DriverMod:send(Socket, Packet) of
         {error, Reason} ->
-            ?log(error, "message=cast event=transmission_failed driver=~s socket=\"~s\" reason=\"~p\"",
-                 [Driver, gen_rpc_helper:socket_to_string(Socket), Reason]),
+            ?tp(error, gen_rpc_error, #{ error  => transmission_failed
+                                       , packet => cast
+                                       , socket => gen_rpc_helper:socket_to_string(Socket)
+                                       , driver => Driver
+                                       , reason => Reason
+                                       }),
             {stop, Reason, State};
         ok ->
             ok = if Activate =:= true -> DriverMod:activate_socket(Socket);
@@ -448,30 +467,35 @@ send_ping(#state{socket=Socket, driver=Driver, driver_mod=DriverMod} = State) ->
 
 cast_worker(NodeOrTuple, Cast, Ret, SendTO) ->
     %% Create a unique name for the client because we register as such
-    PidName = gen_rpc_helper:make_process_name("client", NodeOrTuple),
-    case erlang:whereis(PidName) of
+    PidName = ?NAME(NodeOrTuple),
+    ?tp(gen_rpc_cast, #{ cast => Cast
+                       , target => NodeOrTuple
+                       , sendto => SendTO
+                       , pid => PidName
+                       }),
+    case gen_rpc_registry:whereis_name(PidName) of
         undefined ->
-            ?log(info, "event=client_process_not_found target=\"~p\" action=spawning_client", [NodeOrTuple]),
+            ?tp(info, gen_rpc_client_process_not_found, #{target => NodeOrTuple}),
             case gen_rpc_dispatcher:start_client(NodeOrTuple) of
                 {ok, NewPid} ->
                     %% We take care of CALL inside the gen_server
                     %% This is not resilient enough if the caller's mailbox is full
                     %% but it's good enough for now
-                    erlang:send(NewPid, {Cast,SendTO}),
+                    erlang:send(NewPid, {Cast, SendTO}),
                     Ret;
                 {error, _Reason} ->
                     Ret
             end;
         Pid ->
-            ?log(debug, "event=client_process_found pid=\"~p\" target=\"~p\"", [Pid, NodeOrTuple]),
-            erlang:send(Pid, {Cast,SendTO}),
+            ?tp(debug, gen_rpc_client_process_found, #{pid => Pid, target => NodeOrTuple}),
+            erlang:send(Pid, {Cast, SendTO}),
             Ret
     end.
 
 async_call_worker(NodeOrTuple, M, F, A, Ref) ->
     TTL = gen_rpc_helper:get_async_call_inactivity_timeout(),
-    PidName = gen_rpc_helper:make_process_name("client", NodeOrTuple),
-    SrvPid = case erlang:whereis(PidName) of
+    PidName = ?NAME(NodeOrTuple),
+    SrvPid = case gen_rpc_registry:whereis_name(PidName) of
         undefined ->
             ?log(info, "event=client_process_not_found target=\"~p\" action=spawning_client", [NodeOrTuple]),
             case gen_rpc_dispatcher:start_client(NodeOrTuple) of

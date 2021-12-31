@@ -1,5 +1,8 @@
 # gen_rpc: A scalable RPC library for Erlang-VM based languages
 
+Warning: don't use in the new products!
+This repo is maintained only temporary for legacy support.
+
 ## Overview
 
 - Latest release: ![Tag Version](https://img.shields.io/github/tag/priestjim/gen_rpc.svg)

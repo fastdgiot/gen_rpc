@@ -12,7 +12,7 @@
 %%% Behaviour
 -behaviour(gen_statem).
 
-%%% Include the HUT library
+-include_lib("snabbkaffe/include/trace.hrl").
 -include("logger.hrl").
 %%% Include this library's name macro
 -include("app.hrl").
@@ -48,8 +48,8 @@
 %%% ===================================================
 -spec start_link(atom(), {inet:ip4_address(), inet:port_number()}) -> gen_statem:startlink_ret().
 start_link(Driver, Peer) when is_atom(Driver), is_tuple(Peer) ->
-    Name = gen_rpc_helper:make_process_name("acceptor", Peer),
-    gen_statem:start_link({local,Name}, ?MODULE, {Driver, Peer}, []).
+    Name = {acceptor, Peer},
+    gen_statem:start_link({via, gen_rpc_registry, Name}, ?MODULE, {Driver, Peer}, []).
 
 -spec stop(pid()) -> ok.
 stop(Pid) when is_pid(Pid) ->
@@ -85,10 +85,11 @@ waiting_for_socket({call,From}, {socket_ready,Socket}, #state{driver=Driver, dri
     ok = DriverMod:set_acceptor_opts(Socket),
     ActivateResult = DriverMod:activate_socket(Socket),
     % Now we own the socket
-    ?log(debug, "event=acquiring_socket_ownership driver=~s socket=\"~s\" peer=\"~p\" inet_opts: ~0p",
-         [Driver, gen_rpc_helper:socket_to_string(Socket),
-          gen_rpc_helper:peer_to_string(Peer),
-          prim_inet:getopts(Socket, [gen_rpc_helper:user_tcp_opt_key(Opt)|| Opt <- ?USER_TCP_OPTS])]),
+    ?tp(gen_rpc_acquiring_socket_ownership,
+        #{ driver    => Driver
+         , socket    => gen_rpc_helper:socket_to_string(Socket)
+         , peer      => gen_rpc_helper:peer_to_string(Peer)
+         }),
     ok = gen_statem:reply(From, ok),
     case ActivateResult of
         ok ->
@@ -120,6 +121,10 @@ waiting_for_auth(info, {DriverError, Socket, _Reason} = Msg, #state{socket=Socke
 
 waiting_for_data(info, {Driver,Socket,Data},
                  #state{socket=Socket, driver=Driver, driver_mod=DriverMod, peer=Peer, control=Control, list=List} = State) ->
+    ?tp(gen_rpc_acceptor_receive, #{ socket => gen_rpc_helper:socket_to_string(Socket)
+                                   , peer   => Peer
+                                   , packet => catch erlang:binary_to_term(Data)
+                                   }),
     %% The meat of the whole project: process a function call and return
     %% the data
     try erlang:binary_to_term(Data) of
@@ -136,18 +141,18 @@ waiting_for_data(info, {Driver,Socket,Data},
                         false ->
                             ?log(debug, "event=incompatible_module_version driver=~s socket=\"~s\" method=~s module=~s",
                                  [Driver, gen_rpc_helper:socket_to_string(Socket), CallType, RealM]),
-                            waiting_for_data(info, {CallType, Caller, {badrpc,incompatible}}, State)
+                            reply_immediately({CallType, Caller, {badrpc,incompatible}}, State)
                     end;
                 false ->
                     ?log(debug, "event=request_not_allowed driver=~s socket=\"~s\" control=~s method=~s module=~s",
                          [Driver, gen_rpc_helper:socket_to_string(Socket), Control, CallType, RealM]),
-                    waiting_for_data(info, {CallType, Caller, {badrpc,unauthorized}}, State)
+                    reply_immediately({CallType, Caller, {badrpc,unauthorized}}, State)
             end;
         {cast, _M, _F, _A} = Cast ->
-            handle_cast(Cast, State),
+            _ = handle_cast(Cast, State),
             {keep_state_and_data, gen_rpc_helper:get_inactivity_timeout(?MODULE)};
         BatchCast when is_list(BatchCast) ->
-            [handle_cast(Cast, State) || Cast <- BatchCast],
+            _ = [handle_cast(Cast, State) || Cast <- BatchCast],
             {keep_state_and_data, gen_rpc_helper:get_inactivity_timeout(?MODULE)};
         {abcast, Name, Msg} ->
             _Result = case check_if_module_allowed(erlang, Control, List) of
@@ -166,22 +171,28 @@ waiting_for_data(info, {Driver,Socket,Data},
                     ?log(debug, "event=sbcast_received driver=~s socket=\"~s\" peer=\"~s\" process=~s message=\"~p\"",
                          [Driver, gen_rpc_helper:socket_to_string(Socket), gen_rpc_helper:peer_to_string(Peer), Name, Msg]),
                     case erlang:whereis(Name) of
-                        undefined -> error;
-                        Pid -> Msg = erlang:send(Pid, Msg), success
+                        undefined ->
+                            error;
+                        Pid ->
+                            erlang:send(Pid, Msg),
+                            success
                     end;
                 false ->
                     ?log(debug, "event=request_not_allowed driver=~s socket=\"~s\" control=~s method=~s",
                          [Driver, gen_rpc_helper:socket_to_string(Socket), Control, sbcast]),
                      error
             end,
-            waiting_for_data(info, {sbcast, Caller, Reply}, State);
+            reply_immediately({sbcast, Caller, Reply}, State);
         ping ->
             ?log(debug, "event=ping_received driver=~s socket=\"~s\" peer=\"~s\" action=ignore",
                  [Driver, gen_rpc_helper:socket_to_string(Socket), gen_rpc_helper:peer_to_string(Peer)]),
             {keep_state_and_data, gen_rpc_helper:get_inactivity_timeout(?MODULE)};
         OtherData ->
-            ?log(debug, "event=erroneous_data_received driver=~s socket=\"~s\" peer=\"~s\" data=\"~p\"",
-                 [Driver, gen_rpc_helper:socket_to_string(Socket), gen_rpc_helper:peer_to_string(Peer), OtherData]),
+            ?tp(error, gen_rpc_error, #{ error  => erroneous_data_received
+                                       , socket => gen_rpc_helper:socket_to_string(Socket)
+                                       , peer   => gen_rpc_helper:peer_to_string(Peer)
+                                       , data   => OtherData
+                                       }),
             {stop, {badrpc,erroneous_data}, State}
     catch
         error:badarg ->
@@ -201,18 +212,30 @@ waiting_for_data(info, {DriverError, Socket, _Reason} = Msg, #state{socket=Socke
     handle_event(info, Msg, waiting_for_data, State).
 
 handle_event(info, {DriverClosed, Socket}, _StateName, #state{socket=Socket, driver=Driver, driver_closed=DriverClosed, peer=Peer} = State) ->
-    ?log(notice, "message=channel_closed driver=~s socket=\"~s\" peer=\"~s\" action=stopping",
-         [Driver, gen_rpc_helper:socket_to_string(Socket), gen_rpc_helper:peer_to_string(Peer)]),
+    ?tp(notice, gen_rpc_channel_closed, #{ driver => Driver
+                                         , socket => gen_rpc_helper:socket_to_string(Socket)
+                                         , peer   => gen_rpc_helper:peer_to_string(Peer)
+                                         , action => stopping
+                                         }),
     {stop, normal, State};
 
 handle_event(info, {DriverError, Socket, Reason}, _StateName, #state{socket=Socket, driver=Driver, driver_error=DriverError, peer=Peer} = State) ->
-    ?log(error, "message=channel_error driver=~s socket=\"~s\" peer=\"~s\" reason=\"~p\" action=stopping",
-         [Driver, gen_rpc_helper:socket_to_string(Socket), gen_rpc_helper:peer_to_string(Peer), Reason]),
+    ?tp(error, gen_rpc_error, #{ error  => channel_error
+                               , driver => Driver
+                               , socket => gen_rpc_helper:socket_to_string(Socket)
+                               , peer   => gen_rpc_helper:peer_to_string(Peer)
+                               , action => stopping
+                               , reason => Reason
+                               }),
     {stop, normal, State};
 
-handle_event(EventType, Event, StateName, #state{socket=Socket, driver=Driver} = State) ->
-    ?log(error, "event=uknown_event driver=~s socket=\"~s\" event_type=\"~p\" payload=\"~p\" action=stopping",
-         [Driver, gen_rpc_helper:socket_to_string(Socket), EventType, Event]),
+handle_event(EventType, Event, StateName, #state{peer = Peer, driver=Driver} = State) ->
+    ?tp(error, gen_rpc_error, #{ error     => unknown_event
+                               , driver    => Driver
+                               , EventType => Event
+                               , socket    => gen_rpc_helper:peer_to_string(Peer)
+                               , action    => stopping
+                               }),
     {stop, {StateName, undefined_event, Event}, State}.
 
 terminate(_Reason, _StateName, _State) ->
@@ -317,3 +340,7 @@ handle_cast(UnknownReq, #state{socket=Socket, driver=Driver, peer=Peer}) ->
          [Driver, gen_rpc_helper:socket_to_string(Socket),
           gen_rpc_helper:peer_to_string(Peer), UnknownReq]),
     error(invalid_cast_req).
+
+reply_immediately(Payload, #state{driver_mod = DriverMod, driver = Driver, socket = Socket}) ->
+    reply_call_result(Payload, Socket, Driver, DriverMod),
+    {keep_state_and_data, gen_rpc_helper:get_inactivity_timeout(?MODULE)}.

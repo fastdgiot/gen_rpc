@@ -19,6 +19,9 @@
 all() ->
     gen_rpc_test_helper:get_test_functions(?MODULE).
 
+suite() ->
+  [{timetrap, {minutes, 1}}].
+
 init_per_suite(Config) ->
     %% Starting Distributed Erlang on local node
     {ok, _Pid} = gen_rpc_test_helper:start_distribution(this_node()),

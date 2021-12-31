@@ -132,4 +132,4 @@ sbcast(Nodes, Name, Msg) when is_list(Nodes), is_atom(Name) ->
 
 -spec nodes() -> list().
 nodes() ->
-    gen_rpc_client_sup:nodes().
+    gen_rpc_registry:nodes().

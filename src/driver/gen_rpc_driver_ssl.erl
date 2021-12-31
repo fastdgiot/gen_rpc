@@ -12,7 +12,7 @@
 %%% Behaviour
 -behaviour(gen_rpc_driver).
 
-%%% Include the HUT library
+-include_lib("snabbkaffe/include/trace.hrl").
 -include("logger.hrl").
 %%% Include this library's name macro
 -include("app.hrl").
@@ -46,7 +46,7 @@
 connect(Node, Port) when is_atom(Node) ->
     Host = gen_rpc_helper:host_from_node(Node),
     ConnTO = gen_rpc_helper:get_connect_timeout(),
-    SslOpts = merge_ssl_options(client, Node),
+    SslOpts = merge_ssl_options(client),
     case ssl:connect(Host, Port, SslOpts ++ gen_rpc_helper:get_user_tcp_opts(), ConnTO) of
         {ok, Socket} ->
             ?log(debug, "event=connect_to_remote_server peer=\"~s\" socket=\"~s\" result=success",
@@ -60,7 +60,7 @@ connect(Node, Port) when is_atom(Node) ->
 
 -spec listen(inet:port_number()) -> {ok, ssl:sslsocket()} | {error, term()}.
 listen(Port) when is_integer(Port) ->
-    SslOpts = merge_ssl_options(server, undefined),
+    SslOpts = merge_ssl_options(server),
     ssl:listen(Port, SslOpts ++ gen_rpc_helper:get_user_tcp_opts()).
 
 -spec accept(ssl:sslsocket()) -> {ok, ssl:sslsocket()} | {error, term()}.
@@ -74,21 +74,28 @@ accept(Socket) when is_tuple(Socket) ->
 
 -spec send(ssl:sslsocket(), binary()) -> ok | {error, term()}.
 send(Socket, Data) when is_tuple(Socket), is_binary(Data) ->
+    ?tp(gen_rpc_driver_send, #{data => Data, driver => ssl}),
     case ssl:send(Socket, Data) of
         {error, timeout} ->
-            ?log(error, "event=send_data_failed socket=\"~s\" reason=\"timeout\"", [gen_rpc_helper:socket_to_string(Socket)]),
+            ?tp(error, gen_rpc_error, #{ error  => send_data_failed
+                                       , socket => gen_rpc_helper:socket_to_string(Socket)
+                                       , reason => timeout
+                                       }),
             {error, {badtcp,send_timeout}};
         {error, Reason} ->
-            ?log(error, "event=send_data_failed socket=\"~s\" reason=\"~p\"", [gen_rpc_helper:socket_to_string(Socket), Reason]),
-            {error, {badtcp,Reason}};
+            ?tp(error, gen_rpc_error, #{ error  => send_data_failed
+                                       , socket => gen_rpc_helper:socket_to_string(Socket)
+                                       , reason => Reason
+                                       }),
+            {error, {badtcp, Reason}};
         ok ->
-            ?log(debug, "event=send_data_succeeded socket=\"~s\"", [gen_rpc_helper:socket_to_string(Socket)]),
+            ?tp(gen_rpc_driver_send_ok, #{driver => ssl}),
             ok
     end.
 
 -spec activate_socket(ssl:sslsocket()) -> ok | {error, inet:posix()}.
 activate_socket(Socket) when is_tuple(Socket) ->
-    ssl:setopts(Socket, [{active, once}]).
+    ssl:setopts(Socket, [{active, true}]).
 
 %% Authenticate to a server
 -spec authenticate_server(ssl:sslsocket()) -> ok | {error, {badtcp | badrpc, term()}}.
@@ -136,18 +143,9 @@ authenticate_server(Socket) ->
 authenticate_client(Socket, Peer, Data) ->
     Cookie = erlang:get_cookie(),
     try erlang:binary_to_term(Data) of
-        {gen_rpc_authenticate_connection, Node, Cookie} ->
-            PeerCert = extract_peer_certificate(Socket),
-            {SocketResponse, AuthResult} = case ssl_verify_hostname:verify_cert_hostname(PeerCert, Node) of
-                {fail, AuthReason} ->
-                    ?log(error, "event=node_certificate_mismatch socket=\"~s\" peer=\"~s\" reason=\"~p\"",
-                         [gen_rpc_helper:socket_to_string(Socket), gen_rpc_helper:peer_to_string(Peer), AuthReason]),
-                    {{gen_rpc_connection_rejected,node_certificate_mismatch}, {error,{badrpc,node_certificate_mismatch}}};
-                {valid, _Hostname} ->
-                    ?log(debug, "event=certificate_validated socket=\"~s\" peer=\"~s\"",
-                         [gen_rpc_helper:socket_to_string(Socket), gen_rpc_helper:peer_to_string(Peer)]),
-                    {gen_rpc_connection_authenticated, ok}
-            end,
+        {gen_rpc_authenticate_connection, _Node, Cookie} -> %% Old and insecure way to authenticate peers
+            AuthResult = ok,
+            SocketResponse = gen_rpc_connection_authenticated,
             Packet = erlang:term_to_binary(SocketResponse),
             case send(Socket, Packet) of
                 {error, Reason} ->
@@ -214,21 +212,19 @@ getstat(Socket, OptNames) ->
 %%% ===================================================
 %%% Private functions
 %%% ===================================================
-merge_ssl_options(client, Node) ->
+merge_ssl_options(client) ->
     {ok, ExtraOpts} = application:get_env(?APP, ssl_client_options),
-    NodeStr = atom_to_list(Node),
-    DefaultOpts = lists:append(?SSL_DEFAULT_COMMON_OPTS, ?SSL_DEFAULT_CLIENT_OPTS),
-    VerifyOpts = [{verify_fun, {fun ssl_verify_hostname:verify_fun/3,[{check_hostname,NodeStr}]}}|DefaultOpts],
-    gen_rpc_helper:merge_sockopt_lists(ExtraOpts, VerifyOpts);
+    DefaultOpts = ?SSL_DEFAULT_COMMON_OPTS ++ ?SSL_DEFAULT_CLIENT_OPTS ++ get_cert_options(),
+    gen_rpc_helper:merge_sockopt_lists(ExtraOpts, DefaultOpts);
 
-merge_ssl_options(server, _Node) ->
+merge_ssl_options(server) ->
     {ok, ExtraOpts} = application:get_env(?APP, ssl_server_options),
-    DefaultOpts = lists:append(?SSL_DEFAULT_COMMON_OPTS, ?SSL_DEFAULT_SERVER_OPTS),
+    DefaultOpts = ?SSL_DEFAULT_COMMON_OPTS ++ ?SSL_DEFAULT_SERVER_OPTS ++ get_cert_options(),
     gen_rpc_helper:merge_sockopt_lists(ExtraOpts, DefaultOpts).
 
-extract_peer_certificate(Socket) ->
-    {ok, Cert} = ssl:peercert(Socket),
-    public_key:pkix_decode_cert(Cert, otp).
+get_cert_options() ->
+    [{Key, Val} || Key <- [certfile, keyfile, cacertfile],
+                   {ok, Val} <- [application:get_env(?APP, Key)]].
 
 set_socket_keepalive({unix, darwin}, Socket) ->
     {ok, KeepIdle} = application:get_env(?APP, socket_keepalive_idle),
@@ -252,3 +248,10 @@ set_socket_keepalive({unix, linux}, Socket) ->
 
 set_socket_keepalive(_Unsupported, _Socket) ->
     ok.
+
+%% Dump session keys for wireshark. To enable this feature, add
+%% `{keep_secrets, true}' to `SSL_DEFAULT_COMMON_OPTS' macro
+%% dump_keys(Socket) ->
+%%     {ok, [{keylog, Keylog}]} = ssl:connection_information(Socket, [keylog]),
+%%     IOList = [[I, $\n] || I <- Keylog],
+%%     file:write_file("/tmp/keydump", IOList, [append]).

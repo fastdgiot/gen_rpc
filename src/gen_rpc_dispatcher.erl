@@ -11,8 +11,8 @@
 %%% Behaviour
 -behaviour(gen_server).
 
-%%% Include the HUT library
 -include("logger.hrl").
+-include_lib("snabbkaffe/include/trace.hrl").
 %%% Include this library's name macro
 -include("app.hrl").
 %%% Include helpful guard macros
@@ -49,19 +49,19 @@ start_client(NodeOrTuple) when ?is_node_or_tuple(NodeOrTuple) ->
 %%% Behaviour callbacks
 %%% ===================================================
 init([]) ->
-    ?log(info, "event=start"),
+    ?tp(info, gen_rpc_dispatcher_start, #{}),
     {ok, undefined}.
 
 %% Simply launch a connection to a node through the appropriate
 %% supervisor. This is a serialization interface so that
 handle_call({start_client, NodeOrTuple}, _Caller, undefined) ->
-    PidName = gen_rpc_helper:make_process_name("client", NodeOrTuple),
-    Reply = case erlang:whereis(PidName) of
+    PidName = {client, NodeOrTuple},
+    Reply = case gen_rpc_registry:whereis_name(PidName) of
         undefined ->
-            ?log(debug, "message=start_client event=starting_client_server target=\"~p\"", [NodeOrTuple]),
+            ?tp(debug, gen_rpc_start_client, #{target => NodeOrTuple}),
             gen_rpc_client_sup:start_child(NodeOrTuple);
         Pid ->
-            ?log(debug, "message=start_client event=node_already_started target=\"~p\"", [NodeOrTuple]),
+            ?tp(debug, gen_rpc_client_already_stated, #{target => NodeOrTuple}),
             {ok, Pid}
     end,
     {reply, Reply, undefined};

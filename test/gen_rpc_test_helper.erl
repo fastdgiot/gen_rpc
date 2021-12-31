@@ -9,6 +9,7 @@
 
 %%% CT Macros
 -include_lib("test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 %%% Public API
 -export([start_distribution/1,
@@ -20,12 +21,11 @@
         store_driver_in_config/2,
         get_driver_from_config/1,
         get_test_functions/1,
-        make_process_name/1,
-        make_process_name/2,
         spawn_long_running/1,
         spawn_short_running/0,
         stub_function/0,
-        ping/1]).
+        ping/1,
+        test_call/1]).
 
 %%% ===================================================
 %%% Public API
@@ -62,6 +62,7 @@ start_slave(Driver) ->
     ok = set_driver_configuration(Driver, ?SLAVE),
     %% Start the application remotely
     {ok, _SlaveApps} = rpc:call(?SLAVE, application, ensure_all_started, [?APP]),
+    snabbkaffe:forward_trace(?SLAVE),
     ok.
 
 stop_slave() ->
@@ -86,15 +87,9 @@ set_driver_configuration(ssl, ?MASTER) ->
     CaFile = filename:join([Prefix, "priv", "ssl", "ca.cert.pem"]),
     ok = application:set_env(?APP, default_client_driver, ssl, [{persistent, true}]),
     ok = application:set_env(?APP, ssl_server_port, ?MASTER_PORT, [{persistent, true}]),
-    ok = application:set_env(?APP, ssl_server_options, [
-                             {certfile, CertFile ++ ".cert.pem"},
-                             {keyfile, CertFile ++ ".key.pem"},
-                             {cacertfile, CaFile}], [{persistent, true}]),
-    ok = application:set_env(?APP, ssl_client_options, [
-                             {certfile, CertFile ++ ".cert.pem"},
-                             {keyfile, CertFile ++ ".key.pem"},
-                             {cacertfile, CaFile}], [{persistent, true}]),
-    ok;
+    ok = application:set_env(?APP, certfile, CertFile ++ ".cert.pem", [{persistent, true}]),
+    ok = application:set_env(?APP, keyfile, CertFile ++ ".key.pem", [{persistent, true}]),
+    ok = application:set_env(?APP, cacertfile, CaFile, [{persistent, true}]);
 
 set_driver_configuration(ssl, ?SLAVE) ->
     Prefix = filename:join(["..", "..", ".."]),
@@ -127,7 +122,6 @@ store_driver_in_config(Driver, State) ->
 
 restart_application() ->
     _ = application:stop(?APP),
-    _ = application:unload(?APP),
     ok = timer:sleep(100),
     {ok, _Apps} = application:ensure_all_started(?APP),
     ok.
@@ -162,13 +156,6 @@ get_driver_from_config(Config) ->
         {driver, Driver} -> Driver
     end.
 
-make_process_name(Tag) ->
-    make_process_name(node(), Tag).
-
-make_process_name(Node, Tag) when is_binary(Tag) ->
-    NodeBin = atom_to_binary(Node, utf8),
-    binary_to_atom(<<Tag/binary, NodeBin/binary>>, utf8).
-
 spawn_long_running(TimeSpan) ->
     spawn(fun() -> timer:sleep(TimeSpan) end).
 
@@ -180,3 +167,6 @@ stub_function() ->
 
 ping({Node, Process, Msg}) ->
     {Process, Node} ! {pong, {node(), Process, Msg}}.
+
+test_call(SeqNo) ->
+    ?tp(do_test_call, #{seqno => SeqNo}).

@@ -12,7 +12,7 @@
 
 -callback accept(term()) -> {ok, inet:socket() | ssl:sslsocket()} | {error, term()}.
 
--callback activate_socket(term()) -> ok.
+-callback activate_socket(term()) -> ok | {error, term()}.
 
 -callback authenticate_server(term()) -> ok | {error, {badtcp | badrpc, term()}}.
 

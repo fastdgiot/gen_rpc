@@ -9,6 +9,7 @@
 
 %%% CT Macros
 -include_lib("test/include/ct.hrl").
+-include_lib("stdlib/include/assert.hrl").
 %%% TCP settings
 -include("tcp.hrl").
 
@@ -21,6 +22,9 @@
 all() ->
     gen_rpc_test_helper:get_test_functions(?MODULE).
 
+suite() ->
+    [{timetrap, {minutes, 1}}].
+
 init_per_suite(Config) ->
     %% Starting Distributed Erlang on local node
     {ok, _Pid} = gen_rpc_test_helper:start_distribution(?MASTER),
@@ -31,80 +35,18 @@ init_per_suite(Config) ->
 end_per_suite(_Config) ->
     ok.
 
-init_per_testcase(authentication_timeout, Config) ->
+init_per_testcase(Testcase, Config) ->
+    ct:print("Running ~p", [Testcase]),
     ok = gen_rpc_test_helper:restart_application(),
     ok = gen_rpc_test_helper:start_master(tcp),
-    ok = application:set_env(?APP, authentication_timeout, 500),
-    Config;
+    %% Save environment variables, so they can be restored later:
+    PrevEnv = application:get_all_env(?APP),
+    [{prev_env, PrevEnv}|Config].
 
-init_per_testcase(client_inactivity_timeout, Config) ->
-    ok = gen_rpc_test_helper:restart_application(),
-    ok = gen_rpc_test_helper:start_master(tcp),
-    ok = application:set_env(?APP, client_inactivity_timeout, 500),
-    Config;
-
-init_per_testcase(server_inactivity_timeout, Config) ->
-    ok = gen_rpc_test_helper:restart_application(),
-    ok = gen_rpc_test_helper:start_master(tcp),
-    ok = application:set_env(?APP, server_inactivity_timeout, 500),
-    Config;
-
-init_per_testcase(async_call_inexistent_node, Config) ->
-    ok = gen_rpc_test_helper:restart_application(),
-    ok = gen_rpc_test_helper:start_master(tcp),
-    Config;
-
-init_per_testcase(remote_node_call, Config) ->
-    ok = gen_rpc_test_helper:restart_application(),
-    ok = gen_rpc_test_helper:start_master(tcp),
-    ok = gen_rpc_test_helper:start_slave(tcp),
-    Config;
-
-init_per_testcase(rpc_module_whitelist, Config) ->
-    ok = gen_rpc_test_helper:restart_application(),
-    ok = gen_rpc_test_helper:start_master(tcp),
-    ok = application:set_env(?APP, rpc_module_list, [erlang, os]),
-    ok = application:set_env(?APP, rpc_module_control, whitelist),
-    Config;
-
-init_per_testcase(rpc_module_blacklist, Config) ->
-    ok = gen_rpc_test_helper:restart_application(),
-    ok = gen_rpc_test_helper:start_master(tcp),
-    ok = application:set_env(?APP, rpc_module_list, [erlang, os]),
-    ok = application:set_env(?APP, rpc_module_control, blacklist),
-    Config;
-
-init_per_testcase(_OtherTest, Config) ->
-    Config.
-
-end_per_testcase(authentication_timeout, Config) ->
-    ok = application:set_env(?APP, authentication_timeout, 5000),
-    Config;
-
-end_per_testcase(client_inactivity_timeout, Config) ->
-    ok = application:set_env(?APP, client_inactivity_timeout, infinity),
-    Config;
-
-end_per_testcase(server_inactivity_timeout, Config) ->
-    ok = application:set_env(?APP, server_inactivity_timeout, infinity),
-    Config;
-
-end_per_testcase(remote_node_call, Config) ->
-    ok = gen_rpc_test_helper:stop_slave(),
-    Config;
-
-end_per_testcase(rpc_module_whitelist, Config) ->
-    ok = application:set_env(?APP, rpc_module_list, []),
-    ok = application:set_env(?APP, rpc_module_control, disabled),
-    Config;
-
-end_per_testcase(rpc_module_blacklist, Config) ->
-    ok = application:set_env(?APP, rpc_module_list, []),
-    ok = application:set_env(?APP, rpc_module_control, disabled),
-    Config;
-
-end_per_testcase(_OtherTest, Config) ->
-    Config.
+end_per_testcase(_Testcase, Config) ->
+    %% Restore environment variables:
+    OldEnv = proplists:get_value(prev_env, Config),
+    lists:foreach(fun({K, V}) -> application:set_env(?APP, K, V) end, OldEnv).
 
 %%% ===================================================
 %%% Test cases
@@ -127,7 +69,7 @@ call_anonymous_function(_Config) ->
 
 call_anonymous_undef(_Config) ->
     {badrpc, {'EXIT', {undef,[{os,timestamp_undef,[],[]},_]}}}  = gen_rpc:call(?MASTER, erlang, apply, [fun() -> os:timestamp_undef() end, []]),
-   ok = ct:pal("Result [call_anonymous_undef]: signal=EXIT Reason={os,timestamp_undef}").
+    ok = ct:pal("Result [call_anonymous_undef]: signal=EXIT Reason={os,timestamp_undef}").
 
 call_mfa_undef(_Config) ->
     {badrpc, {'EXIT', {undef,[{os,timestamp_undef,_,_},_]}}} = gen_rpc:call(?MASTER, os, timestamp_undef),
@@ -163,13 +105,17 @@ interleaved_call(_Config) ->
     %% to the remote node and wait an inversely proportionate time
     %% for their result (effectively rendering the results out of order)
     %% in order to test proper data interleaving
-    Pid1 = erlang:spawn(?MODULE, interleaved_call_proc, [self(), 1, infinity]),
-    Pid2 = erlang:spawn(?MODULE, interleaved_call_proc, [self(), 2, 10]),
-    Pid3 = erlang:spawn(?MODULE, interleaved_call_proc, [self(), 3, infinity]),
-    ok = interleaved_call_loop(Pid1, Pid2, Pid3, 0),
-    ok.
+    Pid1 = erlang:spawn(ct_common, interleaved_call_proc, [?MASTER, self(), 1, infinity]),
+    Pid2 = erlang:spawn(ct_common, interleaved_call_proc, [?MASTER, self(), 2, 1]), %% This call should timeout
+    Pid3 = erlang:spawn(ct_common, interleaved_call_proc, [?MASTER, self(), 3, infinity]),
+    ok = ct_common:interleaved_call_loop(Pid1, Pid2, Pid3, 0).
 
 authentication_timeout(_Config) ->
+    ok = application:set_env(?APP, authentication_timeout, 100),
+
+    ok = gen_rpc_test_helper:restart_application(),
+    ok = gen_rpc_test_helper:start_master(tcp),
+
     [] = supervisor:which_children(gen_rpc_acceptor_sup),
     {ok, _Sock} = gen_tcp:connect("127.0.0.1", ?MASTER_PORT, ?TCP_DEFAULT_OPTS),
     %% Give the server some time to launch the acceptor
@@ -288,12 +234,14 @@ async_call_inexistent_node(_Config) ->
     {value, {badrpc, _}} = gen_rpc:nb_yield(YieldKey2, 10000).
 
 client_inactivity_timeout(_Config) ->
+    ok = application:set_env(?APP, client_inactivity_timeout, 500),
     {_Mega, _Sec, _Micro} = gen_rpc:call(?MASTER, os, timestamp),
     ok = timer:sleep(600),
     %% Lookup the client named process, shouldn't be there
     undefined = whereis(?MASTER).
 
 server_inactivity_timeout(_Config) ->
+    ok = application:set_env(?APP, server_inactivity_timeout, 500),
     {_Mega, _Sec, _Micro} = gen_rpc:call(?MASTER, os, timestamp),
     ok = timer:sleep(600),
     %% Lookup the client named process, shouldn't be there
@@ -309,11 +257,15 @@ random_tcp_close(_Config) ->
     [] = supervisor:which_children(gen_rpc_client_sup).
 
 rpc_module_whitelist(_Config) ->
+    ok = application:set_env(?APP, rpc_module_list, [erlang, os]),
+    ok = application:set_env(?APP, rpc_module_control, whitelist),
     {_Mega, _Sec, _Micro} = gen_rpc:call(?MASTER, os, timestamp),
     ?MASTER = gen_rpc:call(?MASTER, erlang, node),
     {badrpc, unauthorized} = gen_rpc:call(?MASTER, application, which_applications).
 
 rpc_module_blacklist(_Config) ->
+    ok = application:set_env(?APP, rpc_module_list, [erlang, os]),
+    ok = application:set_env(?APP, rpc_module_control, blacklist),
     {badrpc, unauthorized} = gen_rpc:call(?MASTER, os, timestamp),
     {badrpc, unauthorized} = gen_rpc:call(?MASTER, erlang, node),
     abcast = gen_rpc:abcast([?MASTER], init, {stop, stop}),
@@ -325,44 +277,3 @@ driver_stub(_Config) ->
 
 client_config_stub(_Config) ->
     ok = gen_rpc_client_config:stub().
-
-%%% ===================================================
-%%% Auxiliary functions for test cases
-%%% ===================================================
-%% Loop in order to receive all messages from all workers
-interleaved_call_loop(Pid1, Pid2, Pid3, Num) when Num < 3 ->
-    receive
-        {reply, Pid1, 1, 1} ->
-            ct:pal("Received proper reply from Worker 1"),
-            interleaved_call_loop(Pid1, Pid2, Pid3, Num+1);
-        {reply, Pid2, 2, {badrpc, timeout}} ->
-            ct:pal("Received proper reply from Worker 2"),
-            interleaved_call_loop(Pid1, Pid2, Pid3, Num+1);
-        {reply, Pid3, 3, 3} ->
-            ct:pal("Received proper reply from Worker 3"),
-            interleaved_call_loop(Pid1, Pid2, Pid3, Num+1);
-        _Else ->
-            ct:pal("Received out of order reply"),
-            fail
-    end;
-interleaved_call_loop(_, _, _, 3) ->
-    ok.
-
-%% This function will become a spawned process that performs the RPC
-%% call and then returns the value of the RPC call
-%% We spawn it in order to achieve parallelism and test out-of-order
-%% execution of multiple RPC calls
-interleaved_call_proc(Caller, Num, Timeout) ->
-    Result = gen_rpc:call(?MASTER, ?MODULE, interleaved_call_executor, [Num], Timeout),
-    Caller ! {reply, self(), Num, Result},
-    ok.
-
-%% This is the function that gets executed in the "remote"
-%% node, sleeping 3 minus $Num seconds and returning the number
-%% effectively returning a number thats inversely proportional
-%% to the number of seconds the worker slept
-interleaved_call_executor(Num) when is_integer(Num) ->
-    %% Sleep for 3 - Num
-    ok = timer:sleep((3 - Num) * 1000),
-    %% Then return the number
-    Num.

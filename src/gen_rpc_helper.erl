@@ -21,26 +21,25 @@
 
 %%% Public API
 -export([peer_to_string/1,
-        socket_to_string/1,
-        host_from_node/1,
-        set_optimal_process_flags/0,
-        make_process_name/2,
-        is_driver_enabled/1,
-        merge_sockopt_lists/2,
-        get_user_tcp_opts/0,
-        user_tcp_opt_key/1,
-        get_server_driver_options/1,
-        get_client_config_per_node/1,
-        get_client_driver_options/1,
-        get_connect_timeout/0,
-        get_send_timeout/1,
-        get_rpc_module_control/0,
-        get_authentication_timeout/0,
-        get_call_receive_timeout/1,
-        get_sbcast_receive_timeout/0,
-        get_control_receive_timeout/0,
-        get_inactivity_timeout/1,
-        get_async_call_inactivity_timeout/0]).
+         socket_to_string/1,
+         host_from_node/1,
+         set_optimal_process_flags/0,
+         is_driver_enabled/1,
+         merge_sockopt_lists/2,
+         get_user_tcp_opts/0,
+         user_tcp_opt_key/1,
+         get_server_driver_options/1,
+         get_client_config_per_node/1,
+         get_client_driver_options/1,
+         get_connect_timeout/0,
+         get_send_timeout/1,
+         get_rpc_module_control/0,
+         get_authentication_timeout/0,
+         get_call_receive_timeout/1,
+         get_sbcast_receive_timeout/0,
+         get_control_receive_timeout/0,
+         get_inactivity_timeout/1,
+         get_async_call_inactivity_timeout/0]).
 
 %%% ===================================================
 %%% Public API
@@ -85,29 +84,6 @@ set_optimal_process_flags() ->
     _ = erlang:process_flag(message_queue_data, off_heap),
     ok.
 
-%% Return an atom to identify gen_rpc processes
-%%
--spec make_process_name(list(), {inet:ip4_address(), inet:port_number()} | node_or_tuple()) -> atom().
-make_process_name("client", {Node,Key}) when is_atom(Node) ->
-    %% This function is going to be called enough to warrant a less pretty
-    %% process name in order to avoid calling costly functions
-    KeyStr = erlang:integer_to_list(erlang:phash2(Key)),
-    NodeStr = erlang:atom_to_list(Node),
-    erlang:list_to_atom("gen_rpc.client." ++ NodeStr ++ "/" ++ KeyStr);
-
-make_process_name("client", Node) when is_atom(Node) ->
-    %% This function is going to be called enough to warrant a less pretty
-    %% process name in order to avoid calling costly functions
-    NodeStr = erlang:atom_to_list(Node),
-    erlang:list_to_atom("gen_rpc.client." ++ NodeStr);
-
-make_process_name("server", Driver) when is_atom(Driver) ->
-    DriverStr = erlang:atom_to_list(Driver),
-    erlang:list_to_atom("gen_rpc_server_" ++ DriverStr);
-
-make_process_name("acceptor", Peer) when is_tuple(Peer) ->
-    erlang:list_to_atom("gen_rpc.acceptor." ++ peer_to_string(Peer)).
-
 %% Merge lists that contain both tuples and simple values observing
 %% keys in proplists
 -spec merge_sockopt_lists(list(), list()) -> list().
@@ -118,13 +94,19 @@ merge_sockopt_lists(List1, List2) ->
 
 -spec is_driver_enabled(atom()) -> boolean().
 is_driver_enabled(Driver) when is_atom(Driver) ->
-    DriverStr = erlang:atom_to_list(Driver),
-    Setting = erlang:list_to_atom(DriverStr ++ "_server_port"),
-    case application:get_env(?APP, Setting) of
-        {ok, false} ->
+    case application:get_env(?APP, driver) of
+        {ok, OtherDriver} when OtherDriver =/= Driver ->
+            %% Driver is set explicitly, and it's a different one:
             false;
-        {ok, _Port} ->
-            true
+        _ ->
+            %% Either the driver is not set, or the settings match:
+            Setting = erlang:list_to_atom(lists:concat([Driver, "_server_port"])),
+            case application:get_env(?APP, Setting) of
+                {ok, false} ->
+                    false;
+                {ok, _Port} ->
+                    true
+            end
     end.
 
 -spec get_server_driver_options(atom()) -> tuple().

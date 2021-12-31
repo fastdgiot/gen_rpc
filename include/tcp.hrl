@@ -3,7 +3,8 @@
 %%%
 %%% Copyright 2015 Panagiotis Papadomitsos. All Rights Reserved.
 %%%
-
+-ifndef(GEN_RPC_HRL_H).
+-define(GEN_RPC_HRL_H, true).
 %%% Default TCP options
 -define(TCP_DEFAULT_OPTS, [binary,
         {packet,4},
@@ -48,3 +49,5 @@
 -define(LINUX_TCP_KEEPIDLE, 16#4). % idle time used when SO_KEEPALIVE is enabled
 -define(LINUX_TCP_KEEPINTVL, 16#5). % interval between keepalives
 -define(LINUX_TCP_KEEPCNT, 16#6). % number of keepalives before close
+
+-endif.
